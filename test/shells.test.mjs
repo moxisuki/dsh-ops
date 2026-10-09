@@ -217,6 +217,62 @@ await test('the System32 WSL launcher is never used as bash', async () => {
   })
 })
 
+await test('the WSL launcher is refused on PATH too, not only in the well-known list', async () => {
+  await withTempDir('shells-wsl-path', async (dir) => {
+    // `System32` is the FIRST entry on a stock Windows PATH, and the PATH walk
+    // runs before the well-known list is consulted. A machine in that default
+    // configuration is the one this exclusion exists for: git/bin is present
+    // and legitimate, and the launcher sits ahead of it.
+    const systemRoot = path.join(dir, 'Windows')
+    const launcher = makeExecutable(path.join(systemRoot, 'System32', 'bash.exe'))
+    const gitDir = path.join(dir, 'Git', 'bin')
+    const gitBash = makeExecutable(path.join(gitDir, 'bash.exe'))
+
+    const resolved = resolveShells(config(), {
+      bundleRoot: path.join(dir, 'plugin'),
+      env: {
+        DSH_HOME: TEST_HOME,
+        PATH: [path.join(systemRoot, 'System32'), gitDir].join(path.delimiter),
+        SystemRoot: systemRoot,
+        ProgramFiles: path.join(dir, 'none'),
+      },
+      platform: 'win32',
+      arch: 'x64',
+    })
+
+    // The walk must skip the launcher and settle on the next entry that is a
+    // real shell, rather than reporting nothing found.
+    assert.notEqual(resolved.bash.file, launcher)
+    assert.equal(resolved.bash.file, gitBash)
+    assert.equal(resolved.bash.source, 'path')
+  })
+})
+
+await test('a PATH holding only the WSL launcher leaves bash missing, not misresolved', async () => {
+  await withTempDir('shells-wsl-only', async (dir) => {
+    const systemRoot = path.join(dir, 'Windows')
+    makeExecutable(path.join(systemRoot, 'System32', 'bash.exe'))
+
+    const resolved = resolveShells(config(), {
+      bundleRoot: path.join(dir, 'plugin'),
+      env: {
+        DSH_HOME: TEST_HOME,
+        PATH: path.join(systemRoot, 'System32'),
+        SystemRoot: systemRoot,
+        ProgramFiles: path.join(dir, 'none'),
+      },
+      platform: 'win32',
+      arch: 'x64',
+    })
+
+    // Losing the rung is the correct outcome here. Running the command inside a
+    // Linux VM against a different filesystem is the failure this refuses to
+    // cause, and it is worse than having no bash at all.
+    assert.equal(resolved.bash.available, false)
+    assert.equal(resolved.bash.source, 'missing')
+  })
+})
+
 await test('a bundled shell is not a system shell, so it survives allowSystemShellFallback:false', async () => {
   await withTempDir('shells-nofallback', async (dir) => {
     const bundled = makeExecutable(bundledShellPath({
@@ -768,7 +824,9 @@ await test('ops_bash runs the resolved bash as `bash -c <command>` through ctx.s
     const definition = bashToolDefinition({ file: shells.bash.file, source: shells.bash.source, subprocess: service })
 
     const controller = new AbortController()
-    const spec = { cwd: 'D:\\work' }
+    // A real directory: the tool now refuses a cwd it cannot resolve, so the
+    // pass-through case has to name one that exists.
+    const spec = { cwd: dir }
     const running = definition.execute(
       { command: 'echo $BASH_VERSION', workdir: spec.cwd, timeoutMs: 5_000, graceMs: 250 },
       { signal: controller.signal },
@@ -779,7 +837,7 @@ await test('ops_bash runs the resolved bash as `bash -c <command>` through ctx.s
     assert.equal(specs.length, 1)
     const [spawned] = specs
     assert.deepEqual(spawned.argv, [bash, '-c', 'echo $BASH_VERSION'])
-    assert.equal(spawned.cwd, 'D:\\work')
+    assert.equal(spawned.cwd, dir)
     assert.equal(spawned.graceMs, 250)
     assert.equal(spawned.signal.aborted, false)
     assert.deepEqual(spawned.env, { ...ENV_OVERRIDES })
@@ -861,6 +919,62 @@ await test('ops_bash rejects a missing command and a bad timeout before spawning
       /no greater than/,
     )
     await assert.rejects(() => definition.execute({ command: 'ls', graceMs: -1 }, exec), /invalid graceMs/)
+    assert.equal(specs.length, 0)
+  })
+})
+
+await test('ops_bash translates a WSL-style workdir into a cwd the OS can use', async () => {
+  await withTempDir('shells-workdir-mnt', async (dir) => {
+    const bash = makeExecutable(path.join(dir, 'bash'))
+    const { service, specs, settle } = fakeSubprocess()
+    const definition = bashToolDefinition({ file: bash, source: 'config', subprocess: service })
+
+    // The drive-mount form is what a caller writes when the command body is a
+    // bash one, and on win32 it is exactly what the process creator cannot
+    // accept as a cwd. The spawn spec must carry the translated path; the
+    // command body is untouched, so the shell still sees `/mnt/...` where it
+    // means it. On a non-Windows host `/mnt/e/...` may be a real path, so the
+    // translation must NOT happen there — both directions are pinned here.
+    const root = path.parse(dir).root
+    const rest = dir.slice(root.length).replaceAll('\\', '/')
+    const wslPath = `/mnt/${root[0].toLowerCase()}/${rest}`
+    const running = definition.execute(
+      { command: 'pwd', workdir: wslPath, timeoutMs: 5_000 },
+      { signal: new AbortController().signal },
+    )
+    settle()
+    await running
+
+    assert.equal(specs.length, 1)
+    if (process.platform === 'win32') {
+      assert.equal(specs[0].cwd, `${root[0].toUpperCase()}:\\${rest.replaceAll('/', '\\')}`)
+    } else {
+      assert.equal(specs[0].cwd, wslPath)
+    }
+  })
+})
+
+await test('ops_bash refuses a workdir it cannot resolve, instead of an ENOENT against bash', async () => {
+  await withTempDir('shells-workdir-missing', async (dir) => {
+    const bash = makeExecutable(path.join(dir, 'bash'))
+    const { service, specs } = fakeSubprocess()
+    const definition = bashToolDefinition({ file: bash, source: 'config', subprocess: service })
+    const exec = { signal: new AbortController().signal }
+
+    // Handed an unresolvable cwd, the OS rejects the *command* and reports it as
+    // `spawn <shell> ENOENT`, which reads as a missing shell. Erroring on the
+    // path that is actually wrong is the whole point of the check.
+    await assert.rejects(
+      () => definition.execute({ command: 'ls', workdir: path.join(dir, 'not-a-dir') }, exec),
+      /workdir is not a directory/,
+    )
+    // A file where a directory belongs is the same failure.
+    const file = path.join(dir, 'a-file')
+    fs.writeFileSync(file, '')
+    await assert.rejects(
+      () => definition.execute({ command: 'ls', workdir: file }, exec),
+      /workdir is not a directory/,
+    )
     assert.equal(specs.length, 0)
   })
 })

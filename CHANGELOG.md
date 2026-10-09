@@ -5,6 +5,52 @@ All notable changes to this package are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — a WSL-style `workdir` reached the OS as a spawn cwd
+
+`ops_bash` passed the caller's `workdir` straight through to `subprocess.spawn`'s
+`cwd`. On win32 that value goes to the process creator, which cannot resolve the
+drive-mount form a bash caller naturally writes — so `workdir: /mnt/e/dir` failed
+before the shell ever started. Worse, the OS reports that failure as an `ENOENT`
+against the **argv entry**, i.e. `spawn <bash> ENOENT`, which reads as a missing
+shell and sends the reader after a binary that is present and fine.
+
+- Translate the drive-mount form (`/mnt/<drive>/...`) to a Windows path before it
+  is used as `cwd`. Only that form is rewritten; a UNC path, a relative path, and
+  a POSIX path on a non-Windows host are returned untouched, so a path the caller
+  meant literally is never reinterpreted.
+- Reject a `workdir` that is not a directory, where the message can name the path
+  that is actually wrong. A cwd the process cannot resolve used to surface as the
+  misleading `ENOENT` above; it now fails as `workdir is not a directory: <path>`
+  and spawns nothing.
+- Document the accepted forms in the `workdir` schema description.
+
+### Fixed — the WSL launcher was reachable through PATH
+
+`wellKnownCandidates` omits `%SystemRoot%\System32\bash.exe` because it is the WSL
+distribution launcher, not a POSIX shell over the caller's filesystem: spawning it
+runs the command inside a Linux VM, against a different filesystem view. That rule
+was enforced only in the hardcoded list, and `fromPath` — which runs **first** —
+applied no such filter. `%SystemRoot%\System32` is the first entry on a stock
+Windows PATH, so on a default install the launcher was found before the list was
+ever consulted and the omission was decorative.
+
+- Add `isWslLauncher` as the single place the exclusion is expressed, and apply it
+  to the PATH walk as well as the well-known list.
+- A PATH holding only the launcher now resolves `bash` as missing. Losing the rung
+  is the correct outcome: a Linux VM command is worse than no bash at all.
+
+### Tests
+
+- Four new cases in `test/shells.test.mjs`: the launcher refused on PATH with a
+  legitimate Git install behind it; a PATH holding only the launcher resolving as
+  missing; the drive-mount translation applied on win32 and **not** applied
+  elsewhere (a `/mnt/...` path is real on a Linux host); and the unusable-`workdir`
+  rejection covering both a missing directory and a file.
+- The existing spawn-spec case now names a real directory, because the tool
+  refuses a cwd it cannot resolve — the pass-through contract is unchanged.
+
 ## [0.2.4] — Independently toggled components
 
 - Split the market bundle into shell (on), file (on), and background (off) rows with exported per-component titles, descriptions, icons and locales.
